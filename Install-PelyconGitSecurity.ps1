@@ -1,51 +1,76 @@
 <#
-Pelycon Device-Level Git Security Bootstrap
-Windows PowerShell Script
+Set-PelyconRepoSecurity.ps1
 
-Purpose:
-- Install/configure Git and Gitleaks once per Windows user profile.
-- Configure global Git hooks so every repo automatically runs Gitleaks.
-- Redact secret values by default so Claude Code does not see the secret in terminal output.
+Pelycon GitHub Repository Security Bootstrap
 
-Normal install:
-Set-ExecutionPolicy -Scope Process Bypass -Force
-.\Install-PelyconGitSecurity.ps1
+What this script configures:
+1. Adds/updates CLAUDE.md.
+2. Adds/updates .gitleaks.toml.
+3. Adds/updates .gitleaksignore.
+4. Adds/updates .github/workflows/security.yml.
+5. Configures safe repository merge settings.
+6. Protects the default branch with:
+   - Pull request required before merge
+   - Required approval count
+   - Dismiss stale approvals
+   - Require approval of most recent push
+   - Require status check named "gitleaks"
+   - Block force pushes
+   - Block branch deletion
+   - Require linear history
 
-Optional self-test:
-.\Install-PelyconGitSecurity.ps1 -RunSelfTest
+Token requirements:
+- Fine-grained PAT:
+  - Repository Administration: Read and write
+  - Repository Contents: Read and write
+  - Repository Workflows: Read and write
+- Classic PAT:
+  - repo
+  - workflow
 
-Force Gitleaks update:
-.\Install-PelyconGitSecurity.ps1 -ForceUpdate
+Example:
+$env:GITHUB_TOKEN = "ghp_xxxxxxxxxxxxxxxxxxxx"
+.\Set-PelyconRepoSecurity.ps1 -Owner "PelyconTechnologies" -Repo "client-app"
 
-Uninstall hook/Gitleaks setup:
-.\Install-PelyconGitSecurity.ps1 -Uninstall
+Dry run:
+.\Set-PelyconRepoSecurity.ps1 -Owner "PelyconTechnologies" -Repo "client-app" -DryRun
 
-Sandbox/admin-only mode that may show actual secret values:
-.\Install-PelyconGitSecurity.ps1 -ShowSecretsInReports
+Notes:
+- Run this before the branch is locked down when possible.
+- If the branch is already protected, committing files directly to the protected branch may fail. In that case, add the files through a PR first, then rerun this script with -SkipFiles.
 #>
 
 [CmdletBinding()]
 param(
-    [switch]$SkipGitInstall,
-    [switch]$RunSelfTest,
-    [switch]$ForceUpdate,
-    [switch]$ShowSecretsInReports,
-    [switch]$Uninstall
+    [Parameter(Mandatory = $true)]
+    [string]$Owner,
+
+    [Parameter(Mandatory = $true)]
+    [string]$Repo,
+
+    [string]$Branch = "main",
+
+    [ValidateRange(1,6)]
+    [int]$RequiredApprovals = 1,
+
+    [string]$RequiredCheckName = "gitleaks",
+
+    [string]$GitHubToken = $env:GITHUB_TOKEN,
+
+    [string]$ApiVersion = "2022-11-28",
+
+    [switch]$SkipFiles,
+    [switch]$SkipRepoSettings,
+    [switch]$SkipBranchProtection,
+    [switch]$EnableGitHubSecretScanningIfAvailable,
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-$PelyconRoot = Join-Path $env:LOCALAPPDATA "Pelycon"
-$ToolsRoot = Join-Path $PelyconRoot "Tools"
-$PortableGitDir = Join-Path $ToolsRoot "PortableGit"
-$GitleaksDir = Join-Path $ToolsRoot "gitleaks"
-$HooksDir = Join-Path $PelyconRoot "GitHooks"
-$LogDir = Join-Path $PelyconRoot "Logs"
-$GitleaksExe = Join-Path $GitleaksDir "gitleaks.exe"
 
 function Write-Step {
     param([string]$Message)
+
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor DarkCyan
     Write-Host $Message -ForegroundColor Cyan
@@ -62,575 +87,446 @@ function Write-Warn {
     Write-Host "[WARN] $Message" -ForegroundColor Yellow
 }
 
-function Test-Command {
-    param([string]$Name)
-    return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
+function Write-Info {
+    param([string]$Message)
+    Write-Host "[INFO] $Message" -ForegroundColor Gray
 }
 
-function Download-File {
-    param(
-        [Parameter(Mandatory = $true)][string]$Uri,
-        [Parameter(Mandatory = $true)][string]$OutFile
-    )
-
-    if ($PSVersionTable.PSVersion.Major -le 5) {
-        Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
-    }
-    else {
-        Invoke-WebRequest -Uri $Uri -OutFile $OutFile
+function Test-Token {
+    if ([string]::IsNullOrWhiteSpace($GitHubToken)) {
+        throw "No GitHub token found. Set `$env:GITHUB_TOKEN or pass -GitHubToken."
     }
 }
 
-function Refresh-CurrentSessionPath {
-    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+function ConvertTo-JsonBody {
+    param([object]$Body)
 
-    $extraPaths = @(
-        "C:\Program Files\Git\cmd",
-        "C:\Program Files\Git\mingw64\bin",
-        "C:\Program Files\Git\usr\bin",
-        "$env:LOCALAPPDATA\Programs\Git\cmd",
-        "$env:LOCALAPPDATA\Programs\Git\mingw64\bin",
-        "$env:LOCALAPPDATA\Programs\Git\usr\bin",
-        "$PortableGitDir\cmd",
-        "$PortableGitDir\mingw64\bin",
-        "$PortableGitDir\usr\bin",
-        $GitleaksDir
-    ) | Where-Object { $_ -and (Test-Path $_) }
-
-    $env:Path = (($extraPaths + ($machinePath -split ";") + ($userPath -split ";")) |
-        Where-Object { $_ -and $_.Trim() -ne "" } |
-        Select-Object -Unique) -join ";"
-}
-
-function Add-DirectoryToUserPath {
-    param([string]$Directory)
-
-    if (-not (Test-Path $Directory)) {
-        return
+    if ($null -eq $Body) {
+        return $null
     }
 
-    $currentUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    $parts = @()
-
-    if (-not [string]::IsNullOrWhiteSpace($currentUserPath)) {
-        $parts = $currentUserPath -split ";" | Where-Object { $_ -and $_.Trim() -ne "" }
-    }
-
-    $alreadyExists = $false
-    foreach ($part in $parts) {
-        if ($part.TrimEnd("\") -ieq $Directory.TrimEnd("\")) {
-            $alreadyExists = $true
-            break
-        }
-    }
-
-    if (-not $alreadyExists) {
-        $newPath = ($parts + $Directory | Select-Object -Unique) -join ";"
-        [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-        Write-Ok "Added to user PATH: $Directory"
-    }
-    else {
-        Write-Ok "Already in user PATH: $Directory"
-    }
-
-    Refresh-CurrentSessionPath
-}
-
-function Convert-ToGitShellPath {
-    param([string]$WindowsPath)
-
-    $p = $WindowsPath -replace "\\", "/"
-
-    if ($p -match "^([A-Za-z]):/(.*)$") {
-        $drive = $matches[1].ToLower()
-        $rest = $matches[2]
-        return "/$drive/$rest"
-    }
-
-    return $p
-}
-
-function Convert-ToGitConfigPath {
-    param([string]$WindowsPath)
-    return ($WindowsPath -replace "\\", "/")
+    return ($Body | ConvertTo-Json -Depth 50)
 }
 
 function Invoke-GitHubApi {
-    param([string]$Uri)
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("GET","POST","PUT","PATCH","DELETE")]
+        [string]$Method,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [object]$Body = $null,
+
+        [switch]$Allow404
+    )
+
+    Test-Token
 
     $headers = @{
-        "User-Agent" = "Pelycon-Git-Security-Bootstrap"
-        "Accept"     = "application/vnd.github+json"
+        "Accept"               = "application/vnd.github+json"
+        "Authorization"        = "Bearer $GitHubToken"
+        "X-GitHub-Api-Version" = $ApiVersion
+        "User-Agent"           = "Pelycon-Repo-Security-Bootstrap"
     }
 
-    return Invoke-RestMethod -Uri $Uri -Headers $headers
+    $uri = "https://api.github.com$Path"
+    $jsonBody = ConvertTo-JsonBody -Body $Body
+
+    if ($DryRun -and $Method -ne "GET") {
+        Write-Host ""
+        Write-Host "[DRY RUN] $Method $uri" -ForegroundColor Yellow
+        if ($null -ne $Body) {
+            Write-Host $jsonBody
+        }
+        return $null
+    }
+
+    try {
+        if ($null -ne $Body) {
+            return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -Body $jsonBody -ContentType "application/json"
+        }
+        else {
+            return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers
+        }
+    }
+    catch {
+        $response = $_.Exception.Response
+
+        if ($Allow404 -and $null -ne $response -and [int]$response.StatusCode -eq 404) {
+            return $null
+        }
+
+        $message = $_.Exception.Message
+
+        try {
+            $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+            $bodyText = $reader.ReadToEnd()
+            if (-not [string]::IsNullOrWhiteSpace($bodyText)) {
+                $message = "$message`nGitHub response:`n$bodyText"
+            }
+        }
+        catch {
+            # Ignore response-body parsing errors.
+        }
+
+        throw $message
+    }
 }
 
-function Install-GitIfMissing {
-    Write-Step "Checking Git"
-    Refresh-CurrentSessionPath
+function Get-RepoInfo {
+    Write-Step "Checking repository"
 
-    if (Test-Command "git.exe") {
-        Write-Ok "Git is already installed."
-        git --version
+    $repoInfo = Invoke-GitHubApi -Method GET -Path "/repos/$Owner/$Repo"
+
+    Write-Ok "Repository found: $($repoInfo.full_name)"
+    Write-Info "Default branch reported by GitHub: $($repoInfo.default_branch)"
+
+    if ([string]::IsNullOrWhiteSpace($Branch)) {
+        $script:Branch = $repoInfo.default_branch
+    }
+
+    return $repoInfo
+}
+
+function ConvertTo-GitHubContentBase64 {
+    param([string]$Content)
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Content)
+    return [Convert]::ToBase64String($bytes)
+}
+
+function ConvertTo-GitHubPath {
+    param([string]$Path)
+
+    # Keep slashes as path separators, but URL-encode each segment.
+    $parts = $Path -split "/"
+    $encodedParts = foreach ($part in $parts) {
+        [System.Uri]::EscapeDataString($part)
+    }
+
+    return ($encodedParts -join "/")
+}
+
+function Set-RepositoryFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Content,
+
+        [Parameter(Mandatory = $true)]
+        [string]$CommitMessage
+    )
+
+    $encodedPath = ConvertTo-GitHubPath -Path $Path
+    $existing = Invoke-GitHubApi -Method GET -Path "/repos/$Owner/$Repo/contents/$encodedPath?ref=$Branch" -Allow404
+
+    $body = @{
+        message = $CommitMessage
+        content = ConvertTo-GitHubContentBase64 -Content $Content
+        branch  = $Branch
+    }
+
+    if ($null -ne $existing -and $existing.sha) {
+        $body.sha = $existing.sha
+        Write-Info "Updating $Path"
+    }
+    else {
+        Write-Info "Creating $Path"
+    }
+
+    Invoke-GitHubApi -Method PUT -Path "/repos/$Owner/$Repo/contents/$encodedPath" -Body $body | Out-Null
+    Write-Ok "$Path committed to $Branch"
+}
+
+function Get-ClaudeMd {
+@"
+# CLAUDE.md — Pelycon Secure Vibe Coding Rules
+
+This repository follows Pelycon's secure vibe-coding workflow. These rules apply to Claude Code and to human contributors.
+
+## Security Rules
+
+- Never hardcode secrets, passwords, tokens, API keys, client secrets, private keys, or production connection strings.
+- Use approved secret storage such as GitHub Actions secrets, Azure Key Vault, environment variables, or the project's approved secret-management method.
+- Treat client data, regulated data, internal security data, and credentials as sensitive.
+- Do not weaken authentication, authorization, tenant isolation, logging, or audit controls without explicit approval.
+- Flag any request that would weaken these rules instead of silently implementing it.
+
+## Workflow Rules
+
+- Work on a feature branch.
+- Do not commit directly to `main` or the default branch.
+- Open a pull request for review before merging.
+- Do not approve your own pull request.
+- Do not bypass required checks, branch protection, rulesets, or review requirements.
+- Change this file only through a pull request.
+
+## Secret Scanning Requirement
+
+This repository requires Gitleaks secret scanning before code is committed, pushed, or merged.
+
+Claude must follow this workflow:
+
+1. Before committing, verify Gitleaks is available:
+
+   ```bash
+   gitleaks version
+   ```
+
+2. Before committing, run a staged secret scan:
+
+   ```bash
+   gitleaks git --pre-commit --staged --redact --no-banner --exit-code 1
+   ```
+
+3. Before pushing, run a repository secret scan:
+
+   ```bash
+   gitleaks git --redact --no-banner --exit-code 1 .
+   ```
+
+4. If Gitleaks finds a secret, stop immediately. Do not commit, push, bypass, ignore, or remove the finding without fixing the secret exposure.
+
+5. Do not use `--no-verify`, skip hooks, disable Gitleaks, change `core.hooksPath`, or bypass checks unless a Pelycon administrator explicitly approves it.
+
+6. If a finding appears to be a false positive, document it and request review before adding anything to `.gitleaksignore`.
+
+The local device-level Pelycon Git Security bootstrap should also run Gitleaks automatically through global Git hooks. The GitHub Actions workflow is the server-side backstop.
+"@
+}
+
+function Get-GitleaksToml {
+@"
+title = "Pelycon Gitleaks Configuration"
+
+[extend]
+useDefault = true
+"@
+}
+
+function Get-GitleaksIgnore {
+@"
+# Approved false-positive fingerprints can go here after review.
+# Do not use this file to hide real secrets.
+"@
+}
+
+function Get-SecurityWorkflow {
+@"
+name: security
+
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks scan
+        run: >
+          docker run --rm -v "`$PWD:/repo"
+          ghcr.io/gitleaks/gitleaks:latest git /repo
+          --redact --no-banner --exit-code 1
+"@
+}
+
+function Set-StandardFiles {
+    Write-Step "Creating/updating repository security files"
+
+    Set-RepositoryFile `
+        -Path "CLAUDE.md" `
+        -Content (Get-ClaudeMd) `
+        -CommitMessage "Add Pelycon Claude security rules"
+
+    Set-RepositoryFile `
+        -Path ".gitleaks.toml" `
+        -Content (Get-GitleaksToml) `
+        -CommitMessage "Add Gitleaks configuration"
+
+    Set-RepositoryFile `
+        -Path ".gitleaksignore" `
+        -Content (Get-GitleaksIgnore) `
+        -CommitMessage "Add Gitleaks ignore file"
+
+    Set-RepositoryFile `
+        -Path ".github/workflows/security.yml" `
+        -Content (Get-SecurityWorkflow) `
+        -CommitMessage "Add Pelycon security workflow"
+}
+
+function Set-RepositorySettings {
+    Write-Step "Configuring repository settings"
+
+    $body = @{
+        allow_squash_merge     = $true
+        allow_merge_commit     = $false
+        allow_rebase_merge     = $false
+        allow_auto_merge       = $false
+        delete_branch_on_merge = $true
+        allow_update_branch    = $true
+    }
+
+    Invoke-GitHubApi -Method PATCH -Path "/repos/$Owner/$Repo" -Body $body | Out-Null
+
+    Write-Ok "Repository merge settings configured:"
+    Write-Host "  - Squash merge: enabled"
+    Write-Host "  - Merge commits: disabled"
+    Write-Host "  - Rebase merge: disabled"
+    Write-Host "  - Auto-delete head branches: enabled"
+}
+
+function Enable-SecretScanningIfAvailable {
+    if (-not $EnableGitHubSecretScanningIfAvailable) {
         return
     }
 
-    if ($SkipGitInstall) {
-        throw "Git is not installed and -SkipGitInstall was used."
-    }
+    Write-Step "Attempting to enable GitHub native secret scanning / push protection"
 
-    Write-Warn "Git was not found. Downloading PortableGit directly from GitHub."
-    Write-Warn "This avoids winget and avoids requiring admin rights for Git."
-
-    $release = Invoke-GitHubApi -Uri "https://api.github.com/repos/git-for-windows/git/releases/latest"
-    $asset = $release.assets |
-        Where-Object { $_.name -match "^PortableGit-.*-64-bit\.7z\.exe$" } |
-        Select-Object -First 1
-
-    if (-not $asset) {
-        throw "Could not find the latest 64-bit PortableGit release asset from GitHub."
-    }
-
-    New-Item -ItemType Directory -Force -Path $ToolsRoot | Out-Null
-    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-
-    if (Test-Path $PortableGitDir) {
-        Write-Warn "Removing old PortableGit folder before reinstalling."
-        Remove-Item -Path $PortableGitDir -Recurse -Force
-    }
-
-    New-Item -ItemType Directory -Force -Path $PortableGitDir | Out-Null
-
-    $installerPath = Join-Path $env:TEMP $asset.name
-    Write-Host "Downloading $($asset.name)..."
-    Download-File -Uri $asset.browser_download_url -OutFile $installerPath
-
-    Write-Host "Extracting PortableGit to $PortableGitDir ..."
-    $extractArg = "-o`"$PortableGitDir`""
-    $process = Start-Process -FilePath $installerPath -ArgumentList @("-y", $extractArg) -Wait -PassThru
-
-    if ($process.ExitCode -ne 0) {
-        throw "PortableGit extraction exited with code $($process.ExitCode)."
-    }
-
-    Add-DirectoryToUserPath -Directory (Join-Path $PortableGitDir "cmd")
-    Add-DirectoryToUserPath -Directory (Join-Path $PortableGitDir "mingw64\bin")
-    Add-DirectoryToUserPath -Directory (Join-Path $PortableGitDir "usr\bin")
-    Refresh-CurrentSessionPath
-
-    if (-not (Test-Command "git.exe")) {
-        throw "PortableGit was extracted, but git.exe is still not available. Close and reopen PowerShell, then rerun this script."
-    }
-
-    Write-Ok "PortableGit installed successfully."
-    git --version
-}
-
-function Get-WindowsArchitectureForGitleaks {
-    $archText = "$env:PROCESSOR_ARCHITECTURE $env:PROCESSOR_ARCHITEW6432"
-
-    if ($archText -match "ARM64") {
-        return "arm64"
-    }
-
-    return "x64"
-}
-
-function Install-Gitleaks {
-    Write-Step "Checking Gitleaks"
-    New-Item -ItemType Directory -Force -Path $GitleaksDir | Out-Null
-
-    if ((Test-Path $GitleaksExe) -and (-not $ForceUpdate)) {
-        try {
-            Write-Ok "Gitleaks is already installed. Skipping download."
-            & $GitleaksExe version
-            Add-DirectoryToUserPath -Directory $GitleaksDir
-            Refresh-CurrentSessionPath
-            return
-        }
-        catch {
-            Write-Warn "Existing Gitleaks copy appears broken. Re-downloading."
+    $body = @{
+        security_and_analysis = @{
+            secret_scanning = @{
+                status = "enabled"
+            }
+            secret_scanning_push_protection = @{
+                status = "enabled"
+            }
         }
     }
-
-    Write-Step "Installing Gitleaks"
-    $arch = Get-WindowsArchitectureForGitleaks
-    Write-Host "Detected Windows architecture: $arch"
-
-    $release = Invoke-GitHubApi -Uri "https://api.github.com/repos/gitleaks/gitleaks/releases/latest"
-    $assetPattern = "gitleaks_.*_windows_$arch\.zip$"
-
-    $asset = $release.assets |
-        Where-Object { $_.name -match $assetPattern } |
-        Select-Object -First 1
-
-    if (-not $asset) {
-        throw "Could not find a Gitleaks Windows $arch release asset."
-    }
-
-    $zipPath = Join-Path $env:TEMP $asset.name
-    $extractDir = Join-Path $env:TEMP ("gitleaks-" + [guid]::NewGuid().ToString())
-
-    Write-Host "Downloading $($asset.name)..."
-    Download-File -Uri $asset.browser_download_url -OutFile $zipPath
-
-    Write-Host "Extracting Gitleaks..."
-    Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
-
-    $downloadedExe = Get-ChildItem -Path $extractDir -Filter "gitleaks.exe" -Recurse | Select-Object -First 1
-
-    if (-not $downloadedExe) {
-        throw "Could not find gitleaks.exe inside the downloaded ZIP."
-    }
-
-    Copy-Item -Path $downloadedExe.FullName -Destination $GitleaksExe -Force
-    $release.tag_name | Set-Content -Path (Join-Path $GitleaksDir "version.txt") -Encoding UTF8
-
-    Add-DirectoryToUserPath -Directory $GitleaksDir
-    Refresh-CurrentSessionPath
-
-    Write-Ok "Gitleaks installed to $GitleaksExe"
-    & $GitleaksExe version
-}
-
-function Write-GlobalGitHooks {
-    Write-Step "Creating global Git hooks"
-    New-Item -ItemType Directory -Force -Path $HooksDir | Out-Null
-
-    $gitleaksShellPath = Convert-ToGitShellPath -WindowsPath $GitleaksExe
-    $showSecretsValue = "false"
-    $redactText = "--redact"
-
-    if ($ShowSecretsInReports) {
-        $showSecretsValue = "true"
-        $redactText = ""
-        Write-Warn "ShowSecretsInReports is enabled. Secret values may be printed in terminal output."
-        Write-Warn "Do not use this mode with Claude Code or normal users."
-    }
-
-    $preCommit = @'
-#!/bin/sh
-set -u
-
-GL="__GITLEAKS_PATH__"
-SHOW_SECRETS="__SHOW_SECRETS__"
-REDACT_FLAG="__REDACT_FLAG__"
-
-if [ ! -x "$GL" ]; then
-  echo ""
-  echo "Pelycon Git Security: Gitleaks was not found at:"
-  echo "  $GL"
-  echo "Rerun Install-PelyconGitSecurity.ps1."
-  exit 1
-fi
-
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  exit 0
-fi
-
-echo "Pelycon Git Security: running Gitleaks pre-commit scan..."
-
-if [ -n "$REDACT_FLAG" ]; then
-  "$GL" git --pre-commit --staged --redact --no-banner --exit-code 1
-else
-  "$GL" git --pre-commit --staged --no-banner --exit-code 1
-fi
-
-STATUS=$?
-
-if [ "$STATUS" -ne 0 ]; then
-  echo ""
-  echo "------------------------------------------------------------"
-  echo "Pelycon Git Security: COMMIT BLOCKED"
-  echo "------------------------------------------------------------"
-  echo "Gitleaks found a possible secret in the staged changes."
-  echo "Review the Gitleaks output above for the file, line, rule, and fingerprint."
-  if [ "$SHOW_SECRETS" = "true" ]; then
-    echo "WARNING: secret-display mode is enabled. The output above may include the actual secret value."
-  else
-    echo "Secret values are redacted by default so they are not exposed to Claude Code, logs, or screenshots."
-  fi
-  echo ""
-  echo "Fix steps:"
-  echo "  1. Remove the secret from the listed file."
-  echo "  2. Put the value in an approved secret store such as Azure Key Vault or GitHub Secrets."
-  echo "  3. If it was a real secret, rotate/revoke it."
-  echo "  4. Stage the cleaned file and commit again."
-  echo ""
-  echo "Do not bypass this with --no-verify unless a Pelycon administrator approves it."
-  exit "$STATUS"
-fi
-
-exit 0
-'@
-
-    $prePush = @'
-#!/bin/sh
-set -u
-
-GL="__GITLEAKS_PATH__"
-SHOW_SECRETS="__SHOW_SECRETS__"
-REDACT_FLAG="__REDACT_FLAG__"
-
-if [ ! -x "$GL" ]; then
-  echo ""
-  echo "Pelycon Git Security: Gitleaks was not found at:"
-  echo "  $GL"
-  echo "Rerun Install-PelyconGitSecurity.ps1."
-  exit 1
-fi
-
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  exit 0
-fi
-
-ROOT="$(git rev-parse --show-toplevel)"
-
-echo "Pelycon Git Security: running Gitleaks pre-push scan..."
-
-if [ -n "$REDACT_FLAG" ]; then
-  "$GL" git --redact --no-banner --exit-code 1 "$ROOT"
-else
-  "$GL" git --no-banner --exit-code 1 "$ROOT"
-fi
-
-STATUS=$?
-
-if [ "$STATUS" -ne 0 ]; then
-  echo ""
-  echo "------------------------------------------------------------"
-  echo "Pelycon Git Security: PUSH BLOCKED"
-  echo "------------------------------------------------------------"
-  echo "Gitleaks found a possible secret in this repository/history."
-  echo "Review the Gitleaks output above for the file, line, rule, and fingerprint."
-  if [ "$SHOW_SECRETS" = "true" ]; then
-    echo "WARNING: secret-display mode is enabled. The output above may include the actual secret value."
-  else
-    echo "Secret values are redacted by default so they are not exposed to Claude Code, logs, or screenshots."
-  fi
-  echo ""
-  echo "Fix steps:"
-  echo "  1. Remove the secret from the listed file/history."
-  echo "  2. Put the value in an approved secret store such as Azure Key Vault or GitHub Secrets."
-  echo "  3. If it was a real secret, rotate/revoke it."
-  echo "  4. Commit the cleaned change and push again."
-  echo ""
-  echo "Do not bypass this with --no-verify unless a Pelycon administrator approves it."
-  exit "$STATUS"
-fi
-
-exit 0
-'@
-
-    $preCommit = $preCommit.Replace("__GITLEAKS_PATH__", $gitleaksShellPath)
-    $preCommit = $preCommit.Replace("__SHOW_SECRETS__", $showSecretsValue)
-    $preCommit = $preCommit.Replace("__REDACT_FLAG__", $redactText)
-
-    $prePush = $prePush.Replace("__GITLEAKS_PATH__", $gitleaksShellPath)
-    $prePush = $prePush.Replace("__SHOW_SECRETS__", $showSecretsValue)
-    $prePush = $prePush.Replace("__REDACT_FLAG__", $redactText)
-
-    Set-Content -Path (Join-Path $HooksDir "pre-commit") -Value $preCommit -Encoding ASCII
-    Set-Content -Path (Join-Path $HooksDir "pre-push") -Value $prePush -Encoding ASCII
-
-    $hooksGitConfigPath = Convert-ToGitConfigPath -WindowsPath $HooksDir
-    $existingHooksPath = $null
 
     try {
-        $existingHooksPath = git config --global --get core.hooksPath
+        Invoke-GitHubApi -Method PATCH -Path "/repos/$Owner/$Repo" -Body $body | Out-Null
+        Write-Ok "GitHub native secret scanning/push protection enabled or already enabled."
     }
     catch {
-        $existingHooksPath = $null
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($existingHooksPath) -and ($existingHooksPath -ne $hooksGitConfigPath)) {
-        Write-Warn "Existing global core.hooksPath will be replaced."
-        Write-Warn "Old: $existingHooksPath"
-        Write-Warn "New: $hooksGitConfigPath"
-    }
-
-    git config --global core.hooksPath "$hooksGitConfigPath"
-
-    Write-Ok "Global Git hooks written to $HooksDir"
-    Write-Ok "Git global core.hooksPath set to $hooksGitConfigPath"
-}
-
-function Test-Installation {
-    Write-Step "Verifying installation"
-
-    Refresh-CurrentSessionPath
-
-    if (-not (Test-Command "git.exe")) {
-        throw "Git is not available."
-    }
-
-    if (-not (Test-Path $GitleaksExe)) {
-        throw "Gitleaks is not installed at $GitleaksExe"
-    }
-
-    $configuredHooks = git config --global --get core.hooksPath
-
-    if ([string]::IsNullOrWhiteSpace($configuredHooks)) {
-        throw "Git global core.hooksPath is not configured."
-    }
-
-    Write-Ok "Git version:"
-    git --version
-
-    Write-Ok "Gitleaks version:"
-    & $GitleaksExe version
-
-    Write-Ok "Global hooks path:"
-    Write-Host $configuredHooks
-
-    if ($ShowSecretsInReports) {
-        Write-Warn "Secret values may be shown because -ShowSecretsInReports is enabled."
-    }
-    else {
-        Write-Ok "Secret values are redacted by default."
-    }
-
-    Write-Ok "Device-level Git security bootstrap is installed."
-}
-
-function Run-SelfTest {
-    Write-Step "Running optional self-test"
-
-    $testRoot = Join-Path $env:TEMP ("pelycon-gitleaks-selftest-" + [guid]::NewGuid().ToString())
-    New-Item -ItemType Directory -Force -Path $testRoot | Out-Null
-
-    Push-Location $testRoot
-
-    try {
-        git init | Out-Null
-        git config user.email "security-test@example.com"
-        git config user.name "Pelycon Security Test"
-
-        "hello" | Set-Content -Path "ok.txt" -Encoding UTF8
-        git add ok.txt
-
-        Write-Host ""
-        Write-Host "Self-test step 1: committing a clean file. This should succeed." -ForegroundColor Cyan
-        git commit -m "clean test"
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "Self-test stopped: clean commit failed. The hook may be misconfigured."
-        }
-
-@"
-GITHUB_TOKEN=ghp_1234567890abcdefghijABCDEFGHIJ123456
-AZURE_CLIENT_SECRET=Ab78Q~zK4mP9xQ2wL7vR3nT8sB6yD1fG5hJ0cA
-"@ | Set-Content -Path "secret-test.txt" -Encoding UTF8
-
-        git add secret-test.txt
-
-        Write-Host ""
-        Write-Host "Self-test step 2: committing fake secrets. This should be blocked by Gitleaks." -ForegroundColor Cyan
-        git commit -m "secret test should be blocked"
-
-        $exitCode = $LASTEXITCODE
-
-        if ($exitCode -eq 0) {
-            throw "Self-test failed: the fake secret commit was not blocked."
-        }
-
-        Write-Host ""
-        Write-Host "Self-test result:" -ForegroundColor Yellow
-        Write-Host "The second commit was blocked because fake secrets were detected." -ForegroundColor Yellow
-        Write-Host "That is the expected result for the self-test." -ForegroundColor Yellow
-        Write-Host "For real work, the user should remove the listed secret and commit again." -ForegroundColor Yellow
-        Write-Host ""
-        Write-Host "Test repo location:"
-        Write-Host "  $testRoot"
-    }
-    finally {
-        Pop-Location
+        Write-Warn "Could not enable GitHub native secret scanning/push protection."
+        Write-Warn "This is usually licensing/plan/organization-policy related. Gitleaks workflow still protects the repo."
+        Write-Warn $_.Exception.Message
     }
 }
 
-function Uninstall-PelyconGitSecurity {
-    Write-Step "Uninstalling Pelycon Git security bootstrap"
-    Refresh-CurrentSessionPath
+function Set-BranchProtection {
+    Write-Step "Configuring branch protection on $Branch"
 
-    if (Test-Command "git.exe") {
-        $configuredHooks = $null
-
-        try {
-            $configuredHooks = git config --global --get core.hooksPath
+    $body = @{
+        required_status_checks = @{
+            strict   = $true
+            contexts = @($RequiredCheckName)
         }
-        catch {
-            $configuredHooks = $null
+        enforce_admins = $true
+        required_pull_request_reviews = @{
+            dismissal_restrictions = @{}
+            dismiss_stale_reviews = $true
+            require_code_owner_reviews = $false
+            required_approving_review_count = $RequiredApprovals
+            require_last_push_approval = $true
+            bypass_pull_request_allowances = @{}
         }
-
-        $expectedHooksPath = Convert-ToGitConfigPath -WindowsPath $HooksDir
-
-        if ($configuredHooks -eq $expectedHooksPath) {
-            git config --global --unset core.hooksPath
-            Write-Ok "Removed global Git core.hooksPath."
-        }
-        elseif (-not [string]::IsNullOrWhiteSpace($configuredHooks)) {
-            Write-Warn "Global core.hooksPath is set to a different path, so it was not removed:"
-            Write-Warn $configuredHooks
-        }
+        restrictions = $null
+        required_linear_history = $true
+        allow_force_pushes = $false
+        allow_deletions = $false
+        block_creations = $false
+        required_conversation_resolution = $true
+        lock_branch = $false
+        allow_fork_syncing = $false
     }
 
-    if (Test-Path $HooksDir) {
-        Remove-Item -Path $HooksDir -Recurse -Force
-        Write-Ok "Removed Pelycon Git hooks folder."
-    }
+    Invoke-GitHubApi -Method PUT -Path "/repos/$Owner/$Repo/branches/$Branch/protection" -Body $body | Out-Null
 
-    if (Test-Path $GitleaksDir) {
-        Remove-Item -Path $GitleaksDir -Recurse -Force
-        Write-Ok "Removed Pelycon Gitleaks folder."
-    }
+    Write-Ok "Branch protection configured for $Branch:"
+    Write-Host "  - Pull request required"
+    Write-Host "  - Required approvals: $RequiredApprovals"
+    Write-Host "  - Most recent push must be approved by someone else"
+    Write-Host "  - Stale approvals dismissed on new commits"
+    Write-Host "  - Required status check: $RequiredCheckName"
+    Write-Host "  - Force pushes blocked"
+    Write-Host "  - Branch deletion blocked"
+    Write-Host "  - Linear history required"
+}
 
-    Write-Ok "Uninstall complete. Git itself was not removed."
+function Show-Summary {
+    Write-Step "Summary"
+
+    Write-Host "Repository:"
+    Write-Host "  https://github.com/$Owner/$Repo"
+    Write-Host ""
+    Write-Host "Branch protected:"
+    Write-Host "  $Branch"
+    Write-Host ""
+    Write-Host "Required status check:"
+    Write-Host "  $RequiredCheckName"
+    Write-Host ""
+    Write-Host "Important next step:"
+    Write-Host "  Push a test branch or open a pull request so the 'gitleaks' check appears in GitHub."
+    Write-Host ""
+    Write-Host "Recommended validation:"
+    Write-Host "  1. Create a branch."
+    Write-Host "  2. Add a fake test secret."
+    Write-Host "  3. Open a PR."
+    Write-Host "  4. Confirm the gitleaks check fails."
+    Write-Host "  5. Remove the fake secret."
+    Write-Host "  6. Confirm the gitleaks check passes."
+    Write-Host "  7. Confirm the PR requires another approver before merge."
 }
 
 try {
-    if ($Uninstall) {
-        Uninstall-PelyconGitSecurity
-        exit 0
+    Write-Step "Starting Pelycon GitHub repository security bootstrap"
+
+    Test-Token
+    Get-RepoInfo | Out-Null
+
+    if (-not $SkipFiles) {
+        Set-StandardFiles
+    }
+    else {
+        Write-Warn "Skipping repository file creation/update because -SkipFiles was used."
     }
 
-    Write-Step "Starting Pelycon device-level Git security bootstrap"
-
-    New-Item -ItemType Directory -Force -Path $PelyconRoot | Out-Null
-    New-Item -ItemType Directory -Force -Path $ToolsRoot | Out-Null
-    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-
-    Install-GitIfMissing
-    Install-Gitleaks
-    Write-GlobalGitHooks
-    Test-Installation
-
-    if ($RunSelfTest) {
-        Run-SelfTest
+    if (-not $SkipRepoSettings) {
+        Set-RepositorySettings
+        Enable-SecretScanningIfAvailable
     }
+    else {
+        Write-Warn "Skipping repository settings because -SkipRepoSettings was used."
+    }
+
+    if (-not $SkipBranchProtection) {
+        Set-BranchProtection
+    }
+    else {
+        Write-Warn "Skipping branch protection because -SkipBranchProtection was used."
+    }
+
+    Show-Summary
 
     Write-Host ""
     Write-Host "DONE" -ForegroundColor Green
-    Write-Host "This device is now configured for Pelycon Git secret scanning." -ForegroundColor Green
-    Write-Host ""
-    Write-Host "What this means:"
-    Write-Host "  - Every Git commit on this Windows profile runs Gitleaks."
-    Write-Host "  - Every Git push on this Windows profile runs Gitleaks."
-    Write-Host "  - This applies to every repo because Git global core.hooksPath is configured."
-    Write-Host "  - Secret values are redacted by default."
-    Write-Host ""
-    Write-Host "Recommended next step:"
-    Write-Host "  Close and reopen PowerShell, Git Bash, and Claude Code so they reload PATH."
-    Write-Host ""
-    Write-Host "Optional test command:"
-    Write-Host "  .\Install-PelyconGitSecurity.ps1 -RunSelfTest"
 }
 catch {
     Write-Host ""
     Write-Host "FAILED" -ForegroundColor Red
     Write-Host $_.Exception.Message -ForegroundColor Red
     Write-Host ""
-    Write-Host "Try closing and reopening PowerShell, then rerun the script."
+    Write-Host "Common fixes:"
+    Write-Host "  - Make sure the token has Administration: write, Contents: write, and Workflows: write."
+    Write-Host "  - If the branch is already protected, run with -SkipFiles after adding files through a PR."
+    Write-Host "  - Make sure the branch name exists. Try -Branch main or -Branch master."
     exit 1
 }
