@@ -1,0 +1,4 @@
+title = "Pelycon Gitleaks Configuration"
+
+[extend]
+useDefault = true
