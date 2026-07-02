@@ -1,43 +1,31 @@
 <#
-Set-PelyconRepoSecurity.ps1
+Pelycon Repository Security Bootstrap
+Windows PowerShell Script
 
-Pelycon GitHub Repository Security Bootstrap
+Purpose:
+- Add/update baseline security files in a GitHub repository.
+- Configure repository settings.
+- Configure branch protection.
+- Optionally create a harmless draft pull request to make the security workflow/check appear in GitHub.
 
-What this script configures:
-1. Adds/updates CLAUDE.md.
-2. Adds/updates .gitleaks.toml.
-3. Adds/updates .gitleaksignore.
-4. Adds/updates .github/workflows/security.yml.
-5. Configures safe repository merge settings.
-6. Protects the default branch with:
-   - Pull request required before merge
-   - Required approval count
-   - Dismiss stale approvals
-   - Require approval of most recent push
-   - Require status check named "gitleaks"
-   - Block force pushes
-   - Block branch deletion
-   - Require linear history
+Required environment variable:
+$env:GITHUB_TOKEN = "your-token"
 
-Token requirements:
-- Fine-grained PAT:
-  - Repository Administration: Read and write
-  - Repository Contents: Read and write
-  - Repository Workflows: Read and write
-- Classic PAT:
-  - repo
-  - workflow
-
-Example:
-$env:GITHUB_TOKEN = "ghp_xxxxxxxxxxxxxxxxxxxx"
-.\Set-PelyconRepoSecurity.ps1 -Owner "PelyconTechnologies" -Repo "client-app"
+Recommended fine-grained PAT permissions:
+- Administration: Read and write
+- Contents: Read and write
+- Workflows: Read and write
+- Pull requests: Read and write, only needed for -CreateTestPullRequest
+- Metadata: Read-only
 
 Dry run:
-.\Set-PelyconRepoSecurity.ps1 -Owner "PelyconTechnologies" -Repo "client-app" -DryRun
+.\Set-PelyconRepoSecurity.ps1 -Owner "TateWilson-dev" -Repo "claude-hooks-test" -DryRun
 
-Notes:
-- Run this before the branch is locked down when possible.
-- If the branch is already protected, committing files directly to the protected branch may fail. In that case, add the files through a PR first, then rerun this script with -SkipFiles.
+Apply:
+.\Set-PelyconRepoSecurity.ps1 -Owner "TateWilson-dev" -Repo "claude-hooks-test"
+
+Apply and create draft test PR:
+.\Set-PelyconRepoSecurity.ps1 -Owner "TateWilson-dev" -Repo "claude-hooks-test" -CreateTestPullRequest
 #>
 
 [CmdletBinding()]
@@ -50,27 +38,29 @@ param(
 
     [string]$Branch = "main",
 
-    [ValidateRange(1,6)]
     [int]$RequiredApprovals = 1,
 
-    [string]$RequiredCheckName = "gitleaks",
+    [string]$GitleaksCheckName = "gitleaks",
 
-    [string]$GitHubToken = $env:GITHUB_TOKEN,
-
-    [string]$ApiVersion = "2022-11-28",
+    [switch]$DryRun,
 
     [switch]$SkipFiles,
+
     [switch]$SkipRepoSettings,
+
     [switch]$SkipBranchProtection,
-    [switch]$EnableGitHubSecretScanningIfAvailable,
-    [switch]$DryRun
+
+    [switch]$CreateTestPullRequest
 )
 
 $ErrorActionPreference = "Stop"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$GitHubApiBase = "https://api.github.com"
+$RepoApiBase = "$GitHubApiBase/repos/$Owner/$Repo"
 
 function Write-Step {
     param([string]$Message)
-
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor DarkCyan
     Write-Host $Message -ForegroundColor Cyan
@@ -87,126 +77,111 @@ function Write-Warn {
     Write-Host "[WARN] $Message" -ForegroundColor Yellow
 }
 
-function Write-Info {
+function Write-DryRun {
     param([string]$Message)
-    Write-Host "[INFO] $Message" -ForegroundColor Gray
+    Write-Host "[DRY RUN] $Message" -ForegroundColor Yellow
 }
 
-function Test-Token {
-    if ([string]::IsNullOrWhiteSpace($GitHubToken)) {
-        throw "No GitHub token found. Set `$env:GITHUB_TOKEN or pass -GitHubToken."
-    }
-}
-
-function ConvertTo-JsonBody {
-    param([object]$Body)
-
-    if ($null -eq $Body) {
-        return $null
+function Get-GitHubToken {
+    if ([string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
+        throw "GITHUB_TOKEN is not set. Run: `$env:GITHUB_TOKEN = `"paste-token-here`""
     }
 
-    return ($Body | ConvertTo-Json -Depth 50)
+    return $env:GITHUB_TOKEN
 }
 
-function Invoke-GitHubApi {
+function Invoke-GitHub {
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet("GET","POST","PUT","PATCH","DELETE")]
         [string]$Method,
 
         [Parameter(Mandatory = $true)]
-        [string]$Path,
+        [string]$Uri,
 
         [object]$Body = $null,
 
         [switch]$Allow404
     )
 
-    Test-Token
+    $token = Get-GitHubToken
 
     $headers = @{
+        "Authorization"        = "Bearer $token"
         "Accept"               = "application/vnd.github+json"
-        "Authorization"        = "Bearer $GitHubToken"
-        "X-GitHub-Api-Version" = $ApiVersion
+        "X-GitHub-Api-Version" = "2022-11-28"
         "User-Agent"           = "Pelycon-Repo-Security-Bootstrap"
     }
 
-    $uri = "https://api.github.com$Path"
-    $jsonBody = ConvertTo-JsonBody -Body $Body
-
-    if ($DryRun -and $Method -ne "GET") {
-        Write-Host ""
-        Write-Host "[DRY RUN] $Method $uri" -ForegroundColor Yellow
-        if ($null -ne $Body) {
-            Write-Host $jsonBody
-        }
-        return $null
-    }
-
     try {
-        if ($null -ne $Body) {
-            return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -Body $jsonBody -ContentType "application/json"
+        if ($null -eq $Body) {
+            return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers
         }
-        else {
-            return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers
-        }
+
+        $json = $Body | ConvertTo-Json -Depth 20
+        return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -Body $json -ContentType "application/json"
     }
     catch {
-        $response = $_.Exception.Response
+        $statusCode = $null
+        try {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+        }
+        catch {
+            $statusCode = $null
+        }
 
-        if ($Allow404 -and $null -ne $response -and [int]$response.StatusCode -eq 404) {
+        if ($Allow404 -and $statusCode -eq 404) {
             return $null
         }
 
         $message = $_.Exception.Message
 
         try {
-            $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
-            $bodyText = $reader.ReadToEnd()
-            if (-not [string]::IsNullOrWhiteSpace($bodyText)) {
-                $message = "$message`nGitHub response:`n$bodyText"
+            $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+            $responseBody = $reader.ReadToEnd()
+            if (-not [string]::IsNullOrWhiteSpace($responseBody)) {
+                $message = "$message`n$responseBody"
             }
         }
         catch {
-            # Ignore response-body parsing errors.
+            # Ignore response parsing failure.
         }
 
         throw $message
     }
 }
 
-function Get-RepoInfo {
-    Write-Step "Checking repository"
+function Test-RepositoryAccess {
+    Write-Step "Checking repository access"
 
-    $repoInfo = Invoke-GitHubApi -Method GET -Path "/repos/$Owner/$Repo"
-
-    Write-Ok "Repository found: $($repoInfo.full_name)"
-    Write-Info "Default branch reported by GitHub: $($repoInfo.default_branch)"
-
-    if ([string]::IsNullOrWhiteSpace($Branch)) {
-        $script:Branch = $repoInfo.default_branch
+    if ($DryRun) {
+        Write-DryRun "Would check repo access for $Owner/$Repo."
     }
 
-    return $repoInfo
+    $repoInfo = Invoke-GitHub -Method "GET" -Uri $RepoApiBase
+    Write-Ok ("Repository found: {0}" -f $repoInfo.full_name)
+
+    $defaultBranch = $repoInfo.default_branch
+    Write-Host ("GitHub default branch: {0}" -f $defaultBranch)
+
+    if ($Branch -ne $defaultBranch) {
+        Write-Warn ("Script branch is '{0}', but GitHub default branch is '{1}'." -f $Branch, $defaultBranch)
+        Write-Warn "Use -Branch '$defaultBranch' if this repo does not use '$Branch'."
+    }
 }
 
-function ConvertTo-GitHubContentBase64 {
-    param([string]$Content)
-
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Content)
-    return [Convert]::ToBase64String($bytes)
-}
-
-function ConvertTo-GitHubPath {
+function Get-FileSha {
     param([string]$Path)
 
-    # Keep slashes as path separators, but URL-encode each segment.
-    $parts = $Path -split "/"
-    $encodedParts = foreach ($part in $parts) {
-        [System.Uri]::EscapeDataString($part)
+    $encodedPath = [System.Uri]::EscapeDataString($Path).Replace("%2F", "/")
+    $uri = "$RepoApiBase/contents/$encodedPath`?ref=$Branch"
+
+    $result = Invoke-GitHub -Method "GET" -Uri $uri -Allow404
+
+    if ($null -eq $result) {
+        return $null
     }
 
-    return ($encodedParts -join "/")
+    return $result.sha
 }
 
 function Set-RepositoryFile {
@@ -218,56 +193,58 @@ function Set-RepositoryFile {
         [string]$Content,
 
         [Parameter(Mandatory = $true)]
-        [string]$CommitMessage
+        [string]$Message
     )
 
-    $encodedPath = ConvertTo-GitHubPath -Path $Path
-    $existing = Invoke-GitHubApi -Method GET -Path "/repos/$Owner/$Repo/contents/$encodedPath?ref=$Branch" -Allow404
+    if ($DryRun) {
+        Write-DryRun ("Would create/update file: {0}" -f $Path)
+        return
+    }
+
+    $sha = Get-FileSha -Path $Path
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Content)
+    $encodedContent = [System.Convert]::ToBase64String($bytes)
 
     $body = @{
-        message = $CommitMessage
-        content = ConvertTo-GitHubContentBase64 -Content $Content
+        message = $Message
+        content = $encodedContent
         branch  = $Branch
     }
 
-    if ($null -ne $existing -and $existing.sha) {
-        $body.sha = $existing.sha
-        Write-Info "Updating $Path"
-    }
-    else {
-        Write-Info "Creating $Path"
+    if (-not [string]::IsNullOrWhiteSpace($sha)) {
+        $body.sha = $sha
     }
 
-    Invoke-GitHubApi -Method PUT -Path "/repos/$Owner/$Repo/contents/$encodedPath" -Body $body | Out-Null
-    Write-Ok "$Path committed to $Branch"
+    $encodedPath = [System.Uri]::EscapeDataString($Path).Replace("%2F", "/")
+    $uri = "$RepoApiBase/contents/$encodedPath"
+
+    Invoke-GitHub -Method "PUT" -Uri $uri -Body $body | Out-Null
+    Write-Ok ("Created/updated {0}" -f $Path)
 }
 
-function Get-ClaudeMd {
-@"
+function Get-ClaudeMdContent {
+@'
 # CLAUDE.md — Pelycon Secure Vibe Coding Rules
 
-This repository follows Pelycon's secure vibe-coding workflow. These rules apply to Claude Code and to human contributors.
+## Security rules
 
-## Security Rules
+- Never hardcode secrets, passwords, tokens, private keys, connection strings, or client secrets.
+- Use approved secret storage such as GitHub Actions secrets, Azure Key Vault, environment variables, or the project-approved secret manager.
+- Do not weaken authentication, authorization, tenant isolation, logging, or audit controls without explicit human approval.
+- Treat this file as a repository security control. Change it only through pull request review.
 
-- Never hardcode secrets, passwords, tokens, API keys, client secrets, private keys, or production connection strings.
-- Use approved secret storage such as GitHub Actions secrets, Azure Key Vault, environment variables, or the project's approved secret-management method.
-- Treat client data, regulated data, internal security data, and credentials as sensitive.
-- Do not weaken authentication, authorization, tenant isolation, logging, or audit controls without explicit approval.
-- Flag any request that would weaken these rules instead of silently implementing it.
+## Workflow rules
 
-## Workflow Rules
+- Work on a feature branch. Do not commit directly to `main` or `master`.
+- Every change must go through a pull request before merge.
+- A human reviewer must approve before code is merged.
+- Do not use `--no-verify` to bypass local Git hooks.
+- If a security check fails, stop and fix the issue instead of bypassing the control.
 
-- Work on a feature branch.
-- Do not commit directly to `main` or the default branch.
-- Open a pull request for review before merging.
-- Do not approve your own pull request.
-- Do not bypass required checks, branch protection, rulesets, or review requirements.
-- Change this file only through a pull request.
+## Secret scanning requirement
 
-## Secret Scanning Requirement
-
-This repository requires Gitleaks secret scanning before code is committed, pushed, or merged.
+All code must be scanned with Gitleaks before it is committed, pushed, or opened as a pull request.
 
 Claude must follow this workflow:
 
@@ -277,46 +254,46 @@ Claude must follow this workflow:
    gitleaks version
    ```
 
-2. Before committing, run a staged secret scan:
+2. Before committing, run:
 
    ```bash
    gitleaks git --pre-commit --staged --redact --no-banner --exit-code 1
    ```
 
-3. Before pushing, run a repository secret scan:
+3. Before pushing, run:
 
    ```bash
    gitleaks git --redact --no-banner --exit-code 1 .
    ```
 
-4. If Gitleaks finds a secret, stop immediately. Do not commit, push, bypass, ignore, or remove the finding without fixing the secret exposure.
+4. If Gitleaks finds a secret, stop immediately.
 
-5. Do not use `--no-verify`, skip hooks, disable Gitleaks, change `core.hooksPath`, or bypass checks unless a Pelycon administrator explicitly approves it.
+5. Do not reveal, print, summarize, or copy the secret value. Only identify the file, line, and rule/fingerprint if needed.
 
-6. If a finding appears to be a false positive, document it and request review before adding anything to `.gitleaksignore`.
+6. If a finding appears to be a false positive, request review before adding anything to `.gitleaksignore`.
 
-The local device-level Pelycon Git Security bootstrap should also run Gitleaks automatically through global Git hooks. The GitHub Actions workflow is the server-side backstop.
-"@
+The local device-level Pelycon Git bootstrap should also run Gitleaks automatically on every commit and push. GitHub Actions runs it again as the server-side backstop.
+'@
 }
 
-function Get-GitleaksToml {
-@"
+function Get-GitleaksTomlContent {
+@'
 title = "Pelycon Gitleaks Configuration"
 
 [extend]
 useDefault = true
-"@
+'@
 }
 
-function Get-GitleaksIgnore {
-@"
+function Get-GitleaksIgnoreContent {
+@'
 # Approved false-positive fingerprints can go here after review.
 # Do not use this file to hide real secrets.
-"@
+'@
 }
 
-function Get-SecurityWorkflow {
-@"
+function Get-SecurityWorkflowContent {
+@'
 name: security
 
 on:
@@ -341,183 +318,259 @@ jobs:
 
       - name: Gitleaks scan
         run: >
-          docker run --rm -v "`$PWD:/repo"
+          docker run --rm -v "$PWD:/repo"
           ghcr.io/gitleaks/gitleaks:latest git /repo
           --redact --no-banner --exit-code 1
-"@
+'@
 }
 
-function Set-StandardFiles {
-    Write-Step "Creating/updating repository security files"
-
-    Set-RepositoryFile `
-        -Path "CLAUDE.md" `
-        -Content (Get-ClaudeMd) `
-        -CommitMessage "Add Pelycon Claude security rules"
-
-    Set-RepositoryFile `
-        -Path ".gitleaks.toml" `
-        -Content (Get-GitleaksToml) `
-        -CommitMessage "Add Gitleaks configuration"
-
-    Set-RepositoryFile `
-        -Path ".gitleaksignore" `
-        -Content (Get-GitleaksIgnore) `
-        -CommitMessage "Add Gitleaks ignore file"
-
-    Set-RepositoryFile `
-        -Path ".github/workflows/security.yml" `
-        -Content (Get-SecurityWorkflow) `
-        -CommitMessage "Add Pelycon security workflow"
-}
-
-function Set-RepositorySettings {
-    Write-Step "Configuring repository settings"
-
-    $body = @{
-        allow_squash_merge     = $true
-        allow_merge_commit     = $false
-        allow_rebase_merge     = $false
-        allow_auto_merge       = $false
-        delete_branch_on_merge = $true
-        allow_update_branch    = $true
-    }
-
-    Invoke-GitHubApi -Method PATCH -Path "/repos/$Owner/$Repo" -Body $body | Out-Null
-
-    Write-Ok "Repository merge settings configured:"
-    Write-Host "  - Squash merge: enabled"
-    Write-Host "  - Merge commits: disabled"
-    Write-Host "  - Rebase merge: disabled"
-    Write-Host "  - Auto-delete head branches: enabled"
-}
-
-function Enable-SecretScanningIfAvailable {
-    if (-not $EnableGitHubSecretScanningIfAvailable) {
+function Set-SecurityFiles {
+    if ($SkipFiles) {
+        Write-Warn "Skipping security file creation/update."
         return
     }
 
-    Write-Step "Attempting to enable GitHub native secret scanning / push protection"
+    Write-Step "Creating/updating security files"
+
+    Set-RepositoryFile -Path "CLAUDE.md" -Content (Get-ClaudeMdContent) -Message "Add Pelycon CLAUDE.md security rules"
+    Set-RepositoryFile -Path ".gitleaks.toml" -Content (Get-GitleaksTomlContent) -Message "Add Pelycon Gitleaks config"
+    Set-RepositoryFile -Path ".gitleaksignore" -Content (Get-GitleaksIgnoreContent) -Message "Add Pelycon Gitleaks ignore file"
+    Set-RepositoryFile -Path ".github/workflows/security.yml" -Content (Get-SecurityWorkflowContent) -Message "Add Pelycon security workflow"
+}
+
+function Set-RepositorySettings {
+    if ($SkipRepoSettings) {
+        Write-Warn "Skipping repository settings."
+        return
+    }
+
+    Write-Step "Configuring repository settings"
 
     $body = @{
-        security_and_analysis = @{
-            secret_scanning = @{
-                status = "enabled"
-            }
-            secret_scanning_push_protection = @{
-                status = "enabled"
-            }
-        }
+        allow_squash_merge          = $true
+        allow_merge_commit          = $false
+        allow_rebase_merge          = $false
+        allow_auto_merge            = $false
+        delete_branch_on_merge      = $true
+        allow_update_branch         = $true
+        squash_merge_commit_title   = "PR_TITLE"
+        squash_merge_commit_message = "PR_BODY"
     }
 
-    try {
-        Invoke-GitHubApi -Method PATCH -Path "/repos/$Owner/$Repo" -Body $body | Out-Null
-        Write-Ok "GitHub native secret scanning/push protection enabled or already enabled."
+    if ($DryRun) {
+        Write-DryRun "Would configure squash merge only and auto-delete branches."
+        return
     }
-    catch {
-        Write-Warn "Could not enable GitHub native secret scanning/push protection."
-        Write-Warn "This is usually licensing/plan/organization-policy related. Gitleaks workflow still protects the repo."
-        Write-Warn $_.Exception.Message
-    }
+
+    Invoke-GitHub -Method "PATCH" -Uri $RepoApiBase -Body $body | Out-Null
+    Write-Ok "Repository settings configured."
 }
 
 function Set-BranchProtection {
-    Write-Step "Configuring branch protection on $Branch"
+    if ($SkipBranchProtection) {
+        Write-Warn "Skipping branch protection."
+        return
+    }
+
+    Write-Step "Configuring branch protection"
+
+    $encodedBranch = [System.Uri]::EscapeDataString($Branch)
+    $uri = "$RepoApiBase/branches/$encodedBranch/protection"
 
     $body = @{
         required_status_checks = @{
             strict   = $true
-            contexts = @($RequiredCheckName)
+            contexts = @($GitleaksCheckName)
         }
         enforce_admins = $true
         required_pull_request_reviews = @{
-            dismissal_restrictions = @{}
-            dismiss_stale_reviews = $true
-            require_code_owner_reviews = $false
             required_approving_review_count = $RequiredApprovals
-            require_last_push_approval = $true
-            bypass_pull_request_allowances = @{}
+            dismiss_stale_reviews           = $true
+            require_code_owner_reviews      = $false
+            require_last_push_approval      = $true
         }
         restrictions = $null
         required_linear_history = $true
         allow_force_pushes = $false
         allow_deletions = $false
         block_creations = $false
-        required_conversation_resolution = $true
+        required_conversation_resolution = $false
         lock_branch = $false
-        allow_fork_syncing = $false
+        allow_fork_syncing = $true
     }
 
-    Invoke-GitHubApi -Method PUT -Path "/repos/$Owner/$Repo/branches/$Branch/protection" -Body $body | Out-Null
+    if ($DryRun) {
+        Write-DryRun ("Would configure branch protection for {0}." -f $Branch)
+        Write-DryRun ("Would require status check: {0}" -f $GitleaksCheckName)
+        Write-DryRun ("Would require approvals: {0}" -f $RequiredApprovals)
+        return
+    }
 
-    Write-Ok "Branch protection configured for $Branch:"
-    Write-Host "  - Pull request required"
-    Write-Host "  - Required approvals: $RequiredApprovals"
-    Write-Host "  - Most recent push must be approved by someone else"
-    Write-Host "  - Stale approvals dismissed on new commits"
-    Write-Host "  - Required status check: $RequiredCheckName"
-    Write-Host "  - Force pushes blocked"
-    Write-Host "  - Branch deletion blocked"
-    Write-Host "  - Linear history required"
+    Invoke-GitHub -Method "PUT" -Uri $uri -Body $body | Out-Null
+    Write-Ok ("Branch protection configured for {0}." -f $Branch)
 }
 
-function Show-Summary {
-    Write-Step "Summary"
+function Get-BranchSha {
+    param([string]$BranchName)
 
-    Write-Host "Repository:"
-    Write-Host "  https://github.com/$Owner/$Repo"
+    $encodedBranch = [System.Uri]::EscapeDataString($BranchName)
+    $uri = "$RepoApiBase/git/ref/heads/$encodedBranch"
+    $ref = Invoke-GitHub -Method "GET" -Uri $uri
+    return $ref.object.sha
+}
+
+function Test-GitRefExists {
+    param([string]$RefName)
+
+    $encodedRef = [System.Uri]::EscapeDataString($RefName).Replace("%2F", "/")
+    $uri = "$RepoApiBase/git/ref/$encodedRef"
+    $result = Invoke-GitHub -Method "GET" -Uri $uri -Allow404
+    return ($null -ne $result)
+}
+
+function New-GitRef {
+    param(
+        [string]$RefName,
+        [string]$Sha
+    )
+
+    $body = @{
+        ref = $RefName
+        sha = $Sha
+    }
+
+    Invoke-GitHub -Method "POST" -Uri "$RepoApiBase/git/refs" -Body $body | Out-Null
+}
+
+function New-TestPullRequest {
+    if (-not $CreateTestPullRequest) {
+        return
+    }
+
+    Write-Step "Creating test branch and draft pull request"
+
+    $testBranch = "pelycon/security-bootstrap-test"
+    $testRef = "refs/heads/$testBranch"
+    $testFilePath = ".pelycon/security-bootstrap-test.txt"
+    $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss K")
+
+    if ($DryRun) {
+        Write-DryRun ("Would create/update branch: {0}" -f $testBranch)
+        Write-DryRun ("Would create/update harmless test file: {0}" -f $testFilePath)
+        Write-DryRun "Would open a draft pull request back into the protected branch."
+        return
+    }
+
+    $baseSha = Get-BranchSha -BranchName $Branch
+
+    if (-not (Test-GitRefExists -RefName "heads/$testBranch")) {
+        New-GitRef -RefName $testRef -Sha $baseSha
+        Write-Ok ("Created test branch: {0}" -f $testBranch)
+    }
+    else {
+        Write-Warn ("Test branch already exists: {0}" -f $testBranch)
+    }
+
+    $content = @"
+Pelycon security bootstrap test
+
+This harmless file was created to trigger the GitHub Actions security workflow
+and make the required Gitleaks status check visible in GitHub.
+
+Created: $timestamp
+Repository: $Owner/$Repo
+Base branch: $Branch
+
+Do not merge this pull request. Close it after confirming the security check appears.
+"@
+
+    $oldBranch = $script:Branch
+    $script:Branch = $testBranch
+
+    try {
+        Set-RepositoryFile -Path $testFilePath -Content $content -Message "Add Pelycon security bootstrap test file"
+    }
+    finally {
+        $script:Branch = $oldBranch
+    }
+
+    $existingPrsUri = "$RepoApiBase/pulls?state=open&head=$Owner`:$testBranch&base=$Branch"
+    $existingPrs = Invoke-GitHub -Method "GET" -Uri $existingPrsUri
+
+    if ($existingPrs.Count -gt 0) {
+        Write-Warn ("A test pull request already exists: {0}" -f $existingPrs[0].html_url)
+        return
+    }
+
+    $prBody = @{
+        title = "Pelycon security bootstrap test"
+        head  = $testBranch
+        base  = $Branch
+        body  = "This draft PR exists only to trigger the security workflow and confirm the required Gitleaks check appears. Do not merge it. Close it after verification."
+        draft = $true
+    }
+
+    $pr = Invoke-GitHub -Method "POST" -Uri "$RepoApiBase/pulls" -Body $prBody
+    Write-Ok ("Draft test pull request opened: {0}" -f $pr.html_url)
+}
+
+function Show-NextSteps {
+    Write-Step "Next steps"
+
+    if ($DryRun) {
+        Write-Host "This was a dry run. No repository changes were made."
+        Write-Host ""
+        Write-Host "To apply changes, rerun without -DryRun:"
+        Write-Host ("  .\Set-PelyconRepoSecurity.ps1 -Owner `"{0}`" -Repo `"{1}`" -CreateTestPullRequest" -f $Owner, $Repo)
+        return
+    }
+
+    Write-Host "Check these areas in GitHub:"
     Write-Host ""
-    Write-Host "Branch protected:"
-    Write-Host "  $Branch"
+    Write-Host "1. Code tab:"
+    Write-Host "   - CLAUDE.md"
+    Write-Host "   - .gitleaks.toml"
+    Write-Host "   - .gitleaksignore"
+    Write-Host "   - .github/workflows/security.yml"
     Write-Host ""
-    Write-Host "Required status check:"
-    Write-Host "  $RequiredCheckName"
+    Write-Host "2. Actions tab:"
+    Write-Host "   - Confirm the 'security' workflow runs."
+    Write-Host "   - Confirm the 'gitleaks' job appears."
     Write-Host ""
-    Write-Host "Important next step:"
-    Write-Host "  Push a test branch or open a pull request so the 'gitleaks' check appears in GitHub."
+    Write-Host "3. Settings -> Branches:"
+    Write-Host ("   - Confirm branch protection exists for {0}." -f $Branch)
+    Write-Host "   - Confirm pull request review and the gitleaks check are required."
     Write-Host ""
-    Write-Host "Recommended validation:"
-    Write-Host "  1. Create a branch."
-    Write-Host "  2. Add a fake test secret."
-    Write-Host "  3. Open a PR."
-    Write-Host "  4. Confirm the gitleaks check fails."
-    Write-Host "  5. Remove the fake secret."
-    Write-Host "  6. Confirm the gitleaks check passes."
-    Write-Host "  7. Confirm the PR requires another approver before merge."
+    if ($CreateTestPullRequest) {
+        Write-Host "4. Draft test PR:"
+        Write-Host "   - Open the draft PR created by the script."
+        Write-Host "   - Confirm the gitleaks check appears and passes."
+        Write-Host "   - Confirm the PR cannot be merged without approval."
+        Write-Host "   - Close the test PR when done. Do not merge it."
+    }
+    else {
+        Write-Host "4. To automatically create a test PR later, rerun with:"
+        Write-Host ("   .\Set-PelyconRepoSecurity.ps1 -Owner `"{0}`" -Repo `"{1}`" -SkipFiles -SkipRepoSettings -SkipBranchProtection -CreateTestPullRequest" -f $Owner, $Repo)
+    }
 }
 
 try {
-    Write-Step "Starting Pelycon GitHub repository security bootstrap"
+    Write-Step "Starting Pelycon repository security bootstrap"
 
-    Test-Token
-    Get-RepoInfo | Out-Null
-
-    if (-not $SkipFiles) {
-        Set-StandardFiles
-    }
-    else {
-        Write-Warn "Skipping repository file creation/update because -SkipFiles was used."
-    }
-
-    if (-not $SkipRepoSettings) {
-        Set-RepositorySettings
-        Enable-SecretScanningIfAvailable
-    }
-    else {
-        Write-Warn "Skipping repository settings because -SkipRepoSettings was used."
-    }
-
-    if (-not $SkipBranchProtection) {
-        Set-BranchProtection
-    }
-    else {
-        Write-Warn "Skipping branch protection because -SkipBranchProtection was used."
-    }
-
-    Show-Summary
+    Test-RepositoryAccess
+    Set-SecurityFiles
+    Set-RepositorySettings
+    Set-BranchProtection
+    New-TestPullRequest
+    Show-NextSteps
 
     Write-Host ""
-    Write-Host "DONE" -ForegroundColor Green
+    if ($DryRun) {
+        Write-Host "DRY RUN COMPLETE" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "DONE" -ForegroundColor Green
+    }
 }
 catch {
     Write-Host ""
@@ -525,8 +578,10 @@ catch {
     Write-Host $_.Exception.Message -ForegroundColor Red
     Write-Host ""
     Write-Host "Common fixes:"
-    Write-Host "  - Make sure the token has Administration: write, Contents: write, and Workflows: write."
-    Write-Host "  - If the branch is already protected, run with -SkipFiles after adding files through a PR."
-    Write-Host "  - Make sure the branch name exists. Try -Branch main or -Branch master."
+    Write-Host "  - Confirm `$env:GITHUB_TOKEN is set in this PowerShell window."
+    Write-Host "  - Confirm the token has Administration, Contents, and Workflows write permissions."
+    Write-Host "  - Add Pull requests write permission if using -CreateTestPullRequest."
+    Write-Host "  - Confirm -Owner and -Repo match the GitHub URL."
+    Write-Host "  - Confirm the branch name with -Branch, for example -Branch `"master`"."
     exit 1
 }
